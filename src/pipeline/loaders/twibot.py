@@ -1,0 +1,144 @@
+
+from __future__ import annotations
+
+import csv
+import json
+import datetime as dt
+from pathlib import Path
+
+from src.pipeline.schema import Edge, RelationType, UserNode, UnifiedGraph
+
+RELATION_MAP_BY_DATASET = {
+    "tb20": {
+        "friend": RelationType.FOLLOW,
+       
+    },
+    "tb22": {
+        "followers": RelationType.FOLLOW,
+        "following": RelationType.FOLLOW,
+    },
+}
+
+_DEFAULT_AVATAR_URLS = {
+    "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+    "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+}
+
+
+def _parse_created_at(raw, dataset_prefix: str) -> dt.datetime | None:
+   
+    if raw is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(float(raw), tz=dt.timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _parse_verified_or_protected(raw, dataset_prefix: str) -> bool:
+    
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() == "true"
+    return False
+
+
+def _is_default_avatar(profile_image_url: str | None) -> bool:
+    if not profile_image_url:
+        return True  # reference code treats missing URL as default-avatar=True
+    return profile_image_url in _DEFAULT_AVATAR_URLS
+
+
+def load_twibot(raw_dir: str | Path, dataset_prefix: str) -> UnifiedGraph:
+    
+    if dataset_prefix not in RELATION_MAP_BY_DATASET:
+        raise ValueError(f"Unknown dataset_prefix {dataset_prefix!r}, expected 'tb20' or 'tb22'")
+    relation_map = RELATION_MAP_BY_DATASET[dataset_prefix]
+
+    raw_dir = Path(raw_dir)
+    node_file = raw_dir / "node.json"
+    if not node_file.exists():
+        node_file = raw_dir / "user.json"  # TwiBot-22 naming
+    with open(node_file) as f:
+        raw_nodes = json.load(f)
+
+    nodes: dict[str, UserNode] = {}
+    for rn in raw_nodes:
+        uid_raw = rn.get("id")
+        if uid_raw is None:
+            continue
+        uid = f"{dataset_prefix}:{uid_raw}"
+
+        public_metrics = rn.get("public_metrics") or {}
+        followers_count = public_metrics.get("followers_count", 0) or 0
+        following_count = public_metrics.get("following_count", 0) or 0
+        listed_count = public_metrics.get("listed_count", 0) or 0
+
+        created_at = _parse_created_at(rn.get("created_at"), dataset_prefix)
+        verified = _parse_verified_or_protected(rn.get("verified"), dataset_prefix)
+        protected = _parse_verified_or_protected(rn.get("protected"), dataset_prefix)
+        default_profile_image = _is_default_avatar(rn.get("profile_image_url"))
+
+        username = rn.get("username") or ""
+        
+        description = rn.get("description") or ""
+
+        nodes[uid] = UserNode(
+            user_id=uid,
+            dataset=dataset_prefix,
+            label=None,  # filled from label.csv below
+            created_at=created_at,
+            metadata={
+                "followers_count": followers_count,
+                "following_count": following_count,
+                "listed_count": listed_count,   # NOTE: reference code's "statuses" is actually this
+                "verified": verified,
+                "protected": protected,
+                "default_profile_image": default_profile_image,
+            },
+            text_blob=" ".join([description, username]).strip(),
+        )
+
+    label_file = raw_dir / "label.csv"
+    if label_file.exists():
+        with open(label_file) as f:
+            for row in csv.DictReader(f):
+                uid = f"{dataset_prefix}:{row['id']}"
+                if uid in nodes:
+                    raw_label = row["label"].strip().lower()
+                    nodes[uid].label = 1 if raw_label in ("bot", "1") else 0
+
+    split: dict[str, str] = {}
+    split_file = raw_dir / "split.csv"
+    if split_file.exists():
+        with open(split_file) as f:
+            for row in csv.DictReader(f):
+                uid = f"{dataset_prefix}:{row['id']}"
+                split[uid] = row["split"]
+
+    edges: list[Edge] = []
+    edge_file = raw_dir / "edge.csv"
+    skipped_relations: set[str] = set()
+    with open(edge_file) as f:
+        for row in csv.DictReader(f):
+            rel_raw = row["relation"].strip().lower()
+            rel = relation_map.get(rel_raw)
+            if rel is None:
+                skipped_relations.add(rel_raw)  # e.g. 'post', or an unmapped TB20 relation
+                continue
+            u = f"{dataset_prefix}:{row['source_id']}"
+            v = f"{dataset_prefix}:{row['target_id']}"
+            
+            edges.append(Edge(u=u, v=v, r=rel, t=None, t_observed=False))
+
+    if skipped_relations:
+       
+        print(f"[loaders.twibot:{dataset_prefix}] Skipped unmapped edge relations: {skipped_relations}")
+
+    return UnifiedGraph(
+        nodes=nodes,
+        edges=edges,
+        split=split,
+        source_datasets=[dataset_prefix],
+    )
